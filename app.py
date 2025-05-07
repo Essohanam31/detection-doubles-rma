@@ -1,100 +1,76 @@
 import streamlit as st
-import pandas as pd
 import requests
-import base64
-from datetime import datetime, timedelta
+import pandas as pd
+from datetime import datetime
+from requests.auth import HTTPBasicAuth
 
-st.set_page_config(page_title="DHIS2 - Audit Utilisateurs", layout="wide")
+st.set_page_config(page_title="Suivi des utilisateurs DHIS2", layout="wide")
 
-# Section Connexion uniquement dans la barre latérale
-st.sidebar.header("🔐 Connexion DHIS2")
-dhis2_url = st.sidebar.text_input("URL", value="https://togo.dhis2.org/dhis")
-username = st.sidebar.text_input("Nom d'utilisateur")
-password = st.sidebar.text_input("Mot de passe", type="password")
+st.title("🔐 Connexion à DHIS2 et Analyse des Utilisateurs")
 
-# Authentification
-def get_auth_header(username, password):
-    token = f"{username}:{password}"
-    encoded = base64.b64encode(token.encode()).decode("utf-8")
-    return {"Authorization": f"Basic {encoded}"}
+# --- Connexion à DHIS2
+dhis2_url = st.text_input("🌍 URL de l'instance DHIS2", "https://play.dhis2.org/40.0")
+username = st.text_input("👤 Nom d'utilisateur", type="default")
+password = st.text_input("🔑 Mot de passe", type="password")
 
-# Récupérer TOUS les utilisateurs
-@st.cache_data(show_spinner=False)
-def get_all_users(base_url, headers):
-    url = f"{base_url}/api/users.json"
-    params = {"paging": "false", "fields": "id,username,name"}
-    r = requests.get(url, headers=headers, params=params)
-    return r.json().get("users", []) if r.status_code == 200 else []
+if st.button("Se connecter"):
+    with st.spinner("Connexion à DHIS2..."):
+        response = requests.get(
+            f"{dhis2_url}/api/me",
+            auth=HTTPBasicAuth(username, password)
+        )
+        if response.status_code == 200:
+            st.success("✅ Connexion réussie.")
+            user_info = response.json()
+            st.write("👤 Utilisateur :", user_info["displayName"])
+        else:
+            st.error("❌ Échec de la connexion. Vérifiez les identifiants.")
+            st.stop()
 
-# Récupérer les connexions
-@st.cache_data(show_spinner=False)
-def get_user_logins(base_url, headers):
-    url = f"{base_url}/api/userCredentials?fields=username,lastLogin&paging=false"
-    r = requests.get(url, headers=headers)
-    return r.json().get("userCredentials", []) if r.status_code == 200 else []
+    # --- Récupération des utilisateurs
+    st.subheader("👥 Récupération des utilisateurs...")
+    users_url = f"{dhis2_url}/api/users?fields=id,name,created,userCredentials[username],organisationUnits[id,name]&paging=false"
+    res_users = requests.get(users_url, auth=HTTPBasicAuth(username, password))
+    users = res_users.json()["users"]
 
-# Formatage date connexion
-def format_login_date(date):
-    if pd.isna(date): return "Jamais"
-    delta = datetime.now() - date
-    if delta.days == 0: return "Aujourd'hui"
-    elif delta.days == 1: return "Hier"
-    elif delta.days < 30: return f"Il y a {delta.days} jours"
-    elif delta.days < 365: return f"Il y a {delta.days//30} mois"
-    return f"Il y a {delta.days//365} ans"
+    data = []
+    for user in users:
+        org_units = [ou["name"] for ou in user.get("organisationUnits", [])]
+        data.append({
+            "Nom complet": user.get("name", ""),
+            "Nom d'utilisateur": user.get("userCredentials", {}).get("username", ""),
+            "Date de création": user.get("created", ""),
+            "Unités d'organisation": ", ".join(org_units)
+        })
 
-# Corps principal
-if username and password and dhis2_url:
-    headers = get_auth_header(username, password)
-    
-    # Bouton unique de chargement
-    if st.button("🔍 Charger tous les utilisateurs"):
-        with st.spinner("Récupération des données..."):
-            users = get_all_users(dhis2_url, headers)
-            logins = get_user_logins(dhis2_url, headers)
-            
-            if users:
-                # Création du DataFrame
-                df = pd.DataFrame(users)[['id', 'username', 'name']]
-                
-                # Ajout dernière connexion
-                df_logins = pd.DataFrame(logins)
-                df_logins['lastLogin'] = pd.to_datetime(df_logins['lastLogin'])
-                df = df.merge(df_logins, on='username', how='left')
-                df['Dernière connexion'] = df['lastLogin'].apply(format_login_date)
-                
-                # Détection doublons
-                df['Doublon'] = df.duplicated('name').map({True: 'Oui', False: 'Non'})
-                
-                # Affichage
-                st.dataframe(
-                    df[['id', 'username', 'name', 'Dernière connexion', 'Doublon']],
-                    column_config={
-                        "id": "ID",
-                        "username": "Nom d'utilisateur",
-                        "name": "Nom complet",
-                        "Dernière connexion": st.column_config.DatetimeColumn("Dernière connexion"),
-                        "Doublon": "Doublon"
-                    },
-                    hide_index=True,
-                    use_container_width=True
-                )
-                
-                # Export
-                csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Télécharger CSV", data=csv, file_name="users.csv", mime='text/csv')
-            else:
-                st.warning("Aucun utilisateur trouvé")
+    df = pd.DataFrame(data)
 
-    # Analyse de période (optionnel)
-    st.sidebar.divider()
-    if st.sidebar.checkbox("Analyse par période"):
-        start = st.sidebar.date_input("Début", datetime.today() - timedelta(days=30))
-        end = st.sidebar.date_input("Fin", datetime.today())
-        
-        if st.sidebar.button("Analyser"):
-            logins = get_user_logins(dhis2_url, headers)
-            df = pd.DataFrame(logins)
-            df['lastLogin'] = pd.to_datetime(df['lastLogin'])
-            df = df[df['lastLogin'].between(pd.to_datetime(start), pd.to_datetime(end))]
-            st.dataframe(df, use_container_width=True)
+    # Convertir la date de création en datetime
+    df["Date de création"] = pd.to_datetime(df["Date de création"])
+
+    # --- Détection des doublons
+    st.subheader("🔍 Doublons (par nom)")
+    dupes = df[df.duplicated("Nom complet", keep=False)]
+    st.dataframe(dupes)
+
+    # --- Dernière activité (commande)
+    st.subheader("📦 Dernière commande enregistrée")
+
+    # Exemple : extraire dernière activité via `dataValueSets` (à adapter selon ton instance)
+    # On prend la date du dernier formulaire soumis par utilisateur fictif
+    def get_days_since_last_submission(user_name):
+        return pd.Timestamp.now() - pd.Timestamp("2024-12-01")  # valeur fictive
+
+    df["Jours depuis dernière activité"] = df["Nom d'utilisateur"].apply(
+        lambda x: get_days_since_last_submission(x).days
+    )
+
+    st.dataframe(df)
+
+    # --- Export CSV
+    st.download_button(
+        label="⬇️ Télécharger CSV",
+        data=df.to_csv(index=False).encode("utf-8"),
+        file_name="utilisateurs_dhis2.csv",
+        mime="text/csv"
+    )
