@@ -1,95 +1,145 @@
+# NOTE: Ce script nécessite : streamlit, pandas, requests, openpyxl
+# Installez-les avec : pip install streamlit pandas requests openpyxl
 
 import streamlit as st
 import pandas as pd
 import requests
 import base64
-from collections import defaultdict
-from io import BytesIO
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Détection des doubles attributions de RMA", layout="wide")
-st.title("🔍 Détection des Doubles Attributions de RMA")
+st.set_page_config(page_title="DHIS2 - Doublons & Audit", layout="wide")
 
-# === Étape 1 : Saisie des identifiants DHIS2 ===
-st.sidebar.header("🔑 Connexion DHIS2")
+# === Barre latérale : Connexion DHIS2 ===
+st.sidebar.header("🔐 Connexion à DHIS2")
+dhis2_url = st.sidebar.text_input("URL DHIS2", value="https://ton_instance.dhis2.org/dhis")
 username = st.sidebar.text_input("Nom d'utilisateur", type="default")
 password = st.sidebar.text_input("Mot de passe", type="password")
 
-# === Étape 2 : Importer le fichier Excel fosa_services.xlsx ===
-st.header("📂 Importer le fichier des relations FOSA - Services")
-uploaded_file = st.file_uploader("Choisissez le fichier fosa_services.xlsx", type=["xlsx"])
+# === Authentification ===
+@st.cache_data(show_spinner=False)
+def get_auth_header(username, password):
+    token = f"{username}:{password}"
+    encoded = base64.b64encode(token.encode()).decode("utf-8")
+    return {"Authorization": f"Basic {encoded}"}
 
-if uploaded_file and username and password:
-    # Authentification DHIS2
-    auth_str = f"{username}:{password}"
-    auth_bytes = auth_str.encode("utf-8")
-    auth_b64 = base64.b64encode(auth_bytes).decode("utf-8")
-    headers = {"Authorization": f"Basic {auth_b64}"}
+# === Obtenir les unités d'organisation ===
+@st.cache_data(show_spinner=False)
+def get_organisation_units(base_url, headers):
+    url = f"{base_url}/api/organisationUnits.json"
+    params = {"paging": "false", "fields": "id,name"}
+    r = requests.get(url, headers=headers, params=params)
+    if r.status_code == 200:
+        return r.json().get("organisationUnits", [])
+    return []
 
-    try:
-        df = pd.read_excel(uploaded_file)
-        st.success("✅ Fichier chargé avec succès.")
+# === Obtenir les utilisateurs pour une unité ===
+def get_users(base_url, headers, org_unit_id):
+    url = f"{base_url}/api/users.json"
+    params = {"paging": "false", "fields": "id,username,name,organisationUnits[id]"}
+    r = requests.get(url, headers=headers, params=params)
+    if r.status_code != 200:
+        st.error("Erreur lors de la récupération des utilisateurs.")
+        return []
+    users = r.json().get("users", [])
+    return [
+        user for user in users
+        if org_unit_id in [ou['id'] for ou in user.get('organisationUnits', [])]
+    ]
 
-        # Construire le mapping FOSA → [services]
-        fosa_to_services = defaultdict(set)
-        for _, row in df.iterrows():
-            fosa_to_services[row["FOSA ID"]].add(row["Service ID"])
+# === Obtenir les connexions des utilisateurs ===
+@st.cache_data(show_spinner=False)
+def get_user_logins(base_url, headers):
+    url = f"{base_url}/api/userCredentials?fields=username,lastLogin&paging=false"
+    r = requests.get(url, headers=headers)
+    if r.status_code == 200:
+        return r.json().get("userCredentials", [])
+    else:
+        return []
 
-        # Requête vers DHIS2 pour récupérer les datasets
-        url = "https://togo.dhis2.org/dhis/api/dataSets.json"
-        params = {"paging": "false", "fields": "id,name,organisationUnits[id]"}
-        response = requests.get(url, headers=headers, params=params)
+if username and password and dhis2_url:
+    headers = get_auth_header(username, password)
 
-        if response.status_code == 200:
-            data = response.json().get("dataSets", [])
-            doublons = []
+    st.sidebar.subheader("🏥 Sélection de l'unité d'organisation")
+    units = get_organisation_units(dhis2_url, headers)
+    unit_options = {unit['name']: unit['id'] for unit in units}
 
-            for dataset in data:
-                dataset_id = dataset["id"]
-                dataset_name = dataset["name"]
-                ou_ids = [ou["id"] for ou in dataset.get("organisationUnits", [])]
+    if unit_options:
+        selected_name = st.sidebar.selectbox("Choisir une unité", list(unit_options.keys()))
+        selected_id = unit_options[selected_name]
 
-                for fosa_id, service_ids in fosa_to_services.items():
-                    attributs = set()
-                    if fosa_id in ou_ids:
-                        attributs.add("fosa")
-                    attrib_services = service_ids.intersection(ou_ids)
-                    if attrib_services:
-                        attributs.update(attrib_services)
-                    if len(attributs) > 1:
-                        doublons.append({
-                            "dataset_id": dataset_id,
-                            "dataset_name": dataset_name,
-                            "fosa_id": fosa_id,
-                            "attribué_à": list(attributs)
-                        })
+        if st.sidebar.button("📥 Charger les utilisateurs"):
+            st.info(f"Chargement des utilisateurs pour l'unité : {selected_name}")
+            users = get_users(dhis2_url, headers, selected_id)
 
-            df_doublons = pd.DataFrame(doublons)
+            if users:
+                df_users = pd.DataFrame(users)[['id', 'username', 'name']]
 
-            if not df_doublons.empty:
-                df_doublons['service_id_extrait'] = df_doublons['attribué_à'].apply(lambda x: [elem for elem in x if elem != 'fosa'])
-                df_doublons['service_id_extrait_str'] = df_doublons['service_id_extrait'].apply(lambda x: ','.join(x) if isinstance(x, list) else x)
-                doublons_services = df_doublons.groupby(['dataset_id', 'fosa_id'])['service_id_extrait_str'].apply(lambda x: len(set(','.join(x).split(','))) > 1).reset_index(name='doublon_detecté')
-                doublons_detectés = doublons_services[doublons_services['doublon_detecté'] == True]
+                # Obtenir et fusionner les connexions
+                logins = get_user_logins(dhis2_url, headers)
+                df_logins = pd.DataFrame(logins)[['username', 'lastLogin']]
+                df_logins['lastLogin'] = pd.to_datetime(df_logins['lastLogin'], errors='coerce')
+                df_users = df_users.merge(df_logins, on='username', how='left')
 
-                st.success(f"✅ {len(doublons_detectés)} doublon(s) détecté(s).")
-                st.dataframe(df_doublons)
+                # Marquer les doublons de noms
+                df_users['doublon'] = df_users.duplicated(subset='name', keep=False)
+                df_users['doublon'] = df_users['doublon'].apply(lambda x: "Oui" if x else "Non")
 
-                # Télécharger le fichier CSV
-                csv_buffer = BytesIO()
-                doublons_detectés.to_csv(csv_buffer, index=False)
+                # Trier par activité
+                df_users = df_users.sort_values(by='lastLogin', ascending=False)
+
+                st.success(f"✅ {len(df_users)} utilisateurs trouvés.")
+
+                # Style avec coloration selon la date de dernière connexion
+                def color_login(val):
+                    if pd.isna(val):
+                        return 'background-color: #f8d7da'  # rouge clair pour aucune connexion
+                    days = (datetime.today() - val).days
+                    if days <= 30:
+                        return 'background-color: #d4edda'  # vert clair si actif
+                    elif days <= 90:
+                        return 'background-color: #fff3cd'  # jaune clair si inactif récent
+                    else:
+                        return 'background-color: #f8d7da'  # rouge clair si inactif prolongé
+                styled_df = df_users.style.applymap(color_login, subset=['lastLogin'])
+
+                st.dataframe(styled_df, use_container_width=True)
+
+                csv = df_users.to_csv(index=False).encode('utf-8')
                 st.download_button(
-                    label="📥 Télécharger les doublons détectés (CSV)",
-                    data=csv_buffer.getvalue(),
-                    file_name="doublons_detectés.csv",
-                    mime="text/csv"
+                    label="📄 Télécharger la liste CSV",
+                    data=csv,
+                    file_name="utilisateurs_dhis2.csv",
+                    mime='text/csv'
                 )
             else:
-                st.info("Aucun doublon détecté.")
+                st.warning("Aucun utilisateur trouvé pour cette unité.")
 
+    # === Audit période activité globale ===
+    st.sidebar.subheader("📊 Période d'analyse des connexions")
+    start_date = st.sidebar.date_input("Début", datetime.today() - timedelta(days=30))
+    end_date = st.sidebar.date_input("Fin", datetime.today())
+
+    if start_date > end_date:
+        st.sidebar.error("La date de début doit être antérieure à la date de fin.")
+    elif st.sidebar.button("📈 Analyser l'activité globale"):
+        st.subheader("🔍 Audit global de l'activité des utilisateurs DHIS2")
+        data = get_user_logins(dhis2_url, headers)
+        df = pd.DataFrame(data)
+        df['lastLogin'] = pd.to_datetime(df['lastLogin'], errors='coerce')
+        df['Actif durant la période'] = df['lastLogin'].apply(
+            lambda x: "Oui" if pd.notnull(x) and start_date <= x.date() <= end_date else "Non"
+        )
+
+        st.dataframe(df.sort_values("lastLogin", ascending=False), use_container_width=True)
+
+        actifs = df[df["Actif durant la période"] == "Oui"]
+        if not actifs.empty:
+            excel_data = actifs.to_excel(index=False, engine='openpyxl')
+            st.download_button(
+                "📤 Exporter les utilisateurs actifs (Excel)",
+                data=excel_data,
+                file_name="utilisateurs_actifs.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
         else:
-            st.error("Erreur lors de la récupération des datasets depuis DHIS2. Vérifiez vos identifiants.")
-
-    except Exception as e:
-        st.error(f"Erreur lors du traitement : {e}")
-else:
-    st.info("Veuillez importer un fichier Excel et entrer vos identifiants DHIS2.")
+            st.info("Aucun utilisateur actif trouvé durant la période.")
