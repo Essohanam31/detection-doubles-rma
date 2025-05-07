@@ -8,7 +8,7 @@ st.set_page_config(page_title="DHIS2 - Doublons & Audit", layout="wide")
 
 # Onglet Connexion
 st.sidebar.header("🔐 Connexion à DHIS2")
-dhis2_url = st.sidebar.text_input("URL DHIS2", value="https://ton_instance.dhis2.org/dhis")
+dhis2_url = st.sidebar.text_input("URL DHIS2", value="https://togo.dhis2.org/dhis")
 username = st.sidebar.text_input("Nom d'utilisateur", type="default")
 password = st.sidebar.text_input("Mot de passe", type="password")
 
